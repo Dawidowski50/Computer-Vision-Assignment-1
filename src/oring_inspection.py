@@ -1,25 +1,65 @@
 #!/usr/bin/env python3
 """
 Computer Vision Assignment 1
-O-ring inspection — project scaffold
 
-Commit 1:
-- Command-line interface
-- Image loading
-- Output directory creation
-- Save input images to output folder
+Commit 2:
+- Manual histogram computation
+- Manual Otsu thresholding
+- Save binary threshold output
 """
 
 import argparse
 from pathlib import Path
 
 import cv2 as cv
+import numpy as np
 
 
 def list_images(folder: Path):
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
     return [p for p in sorted(folder.iterdir()) if p.suffix.lower() in exts]
 
+
+# ----------------------------
+# Histogram + Otsu threshold
+# ----------------------------
+
+def histogram_u8(gray_u8: np.ndarray) -> np.ndarray:
+    """Compute 256-bin histogram manually using NumPy."""
+    return np.bincount(gray_u8.ravel(), minlength=256).astype(np.int64)
+
+
+def otsu_threshold(hist: np.ndarray) -> int:
+    """Compute Otsu threshold from histogram."""
+    hist = hist.astype(np.float64)
+    total = hist.sum()
+
+    if total == 0:
+        return 127
+
+    prob = hist / total
+    omega = np.cumsum(prob)
+    mu = np.cumsum(prob * np.arange(256))
+    mu_t = mu[-1]
+
+    denom = omega * (1 - omega)
+    denom[denom == 0] = np.nan
+
+    sigma_b2 = (mu_t * omega - mu) ** 2 / denom
+
+    return int(np.nanargmax(sigma_b2))
+
+
+def threshold_otsu(gray_u8: np.ndarray):
+    hist = histogram_u8(gray_u8)
+    t = otsu_threshold(hist)
+    binary = (gray_u8 <= t).astype(np.uint8)
+    return binary, t
+
+
+# ----------------------------
+# Main
+# ----------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -39,16 +79,19 @@ def main() -> int:
     print(f"Found {len(images)} images in {input_dir}")
 
     for img_path in images:
-        img = cv.imread(str(img_path), cv.IMREAD_GRAYSCALE)
-        if img is None:
+        gray = cv.imread(str(img_path), cv.IMREAD_GRAYSCALE)
+        if gray is None:
             print(f"Could not read {img_path.name}")
             continue
 
-        out_path = output_dir / img_path.name
-        cv.imwrite(str(out_path), img)
-        print(f"Saved {out_path.name}")
+        binary01, t = threshold_otsu(gray)
 
-    print("Done.")
+        out_path = output_dir / f"{img_path.stem}_binary.png"
+        cv.imwrite(str(out_path), (binary01 * 255).astype(np.uint8))
+
+        print(f"{img_path.name}: Otsu T={t}")
+
+    print("Done.") 
     return 0
 
 
