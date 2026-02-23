@@ -2,14 +2,16 @@
 """
 Computer Vision Assignment 1
 
-Commit 3:
-- Manual histogram computation
-- Manual Otsu thresholding
-- Manual binary morphology (dilation/erosion + closing)
-- Save binary + cleaned outputs
+Commit 4:
+- Manual histogram + Otsu threshold
+- Manual binary morphology (closing)
+- Manual connected component labelling (BFS)
+- Extract largest component as O-ring region
+- Save binary, cleaned, ring masks
 """
 
 import argparse
+from collections import deque
 from pathlib import Path
 
 import cv2 as cv
@@ -49,7 +51,7 @@ def otsu_threshold(hist: np.ndarray) -> int:
 
 def threshold_otsu(gray_u8: np.ndarray):
     t = otsu_threshold(histogram_u8(gray_u8))
-    binary01 = (gray_u8 <= t).astype(np.uint8)  # ring assumed darker than background
+    binary01 = (gray_u8 <= t).astype(np.uint8)
     return binary01, t
 
 
@@ -111,6 +113,64 @@ def to_u8(binary01: np.ndarray) -> np.ndarray:
 
 
 # ----------------------------
+# Connected Component Labelling (BFS)
+# ----------------------------
+
+def ccl_labels(binary01: np.ndarray, connectivity: int = 8):
+    """
+    Connected components for binary image.
+    Returns (labels, sizes), where labels are 0=background, 1..K components,
+    and sizes is a list of pixel counts.
+    """
+    h, w = binary01.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    sizes = []
+    current = 0
+
+    if connectivity == 8:
+        nbrs = [(-1, -1), (-1, 0), (-1, 1),
+                (0, -1),           (0, 1),
+                (1, -1),  (1, 0),  (1, 1)]
+    elif connectivity == 4:
+        nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:
+        raise ValueError("connectivity must be 4 or 8")
+
+    q = deque()
+
+    for y in range(h):
+        for x in range(w):
+            if binary01[y, x] == 1 and labels[y, x] == 0:
+                current += 1
+                labels[y, x] = current
+                q.append((y, x))
+                count = 0
+
+                while q:
+                    cy, cx = q.popleft()
+                    count += 1
+                    for dy, dx in nbrs:
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < h and 0 <= nx < w:
+                            if binary01[ny, nx] == 1 and labels[ny, nx] == 0:
+                                labels[ny, nx] = current
+                                q.append((ny, nx))
+
+                sizes.append(count)
+
+    return labels, sizes
+
+
+def largest_component(binary01: np.ndarray):
+    labels, sizes = ccl_labels(binary01, connectivity=8)
+    if not sizes:
+        return np.zeros_like(binary01, dtype=np.uint8), 0
+    k = int(np.argmax(np.asarray(sizes))) + 1
+    mask01 = (labels == k).astype(np.uint8)
+    return mask01, sizes[k - 1]
+
+
+# ----------------------------
 # Main
 # ----------------------------
 
@@ -142,10 +202,13 @@ def main() -> int:
         binary01, t = threshold_otsu(gray)
         cleaned01 = close01(binary01, se, iterations=2)
 
+        ring01, ring_size = largest_component(cleaned01)
+
         cv.imwrite(str(output_dir / f"{img_path.stem}_binary.png"), to_u8(binary01))
         cv.imwrite(str(output_dir / f"{img_path.stem}_cleaned.png"), to_u8(cleaned01))
+        cv.imwrite(str(output_dir / f"{img_path.stem}_ring.png"), to_u8(ring01))
 
-        print(f"{img_path.name}: Otsu T={t}")
+        print(f"{img_path.name}: Otsu T={t}, ring_size={ring_size}")
 
     print("Done.")
     return 0
