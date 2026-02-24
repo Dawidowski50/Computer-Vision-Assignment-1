@@ -2,12 +2,14 @@
 """
 Computer Vision Assignment 1
 
-Commit 4:
+Commit 5:
 - Manual histogram + Otsu threshold
 - Manual binary morphology (closing)
 - Manual connected component labelling (BFS)
-- Extract largest component as O-ring region
-- Save binary, cleaned, ring masks
+- Extract largest component as O-ring
+- Fill holes (flood-fill background from borders)
+- Compute defect-hole pixels excluding the central hole (largest enclosed void)
+- Save binary, cleaned, ring, filled masks
 """
 
 import argparse
@@ -117,11 +119,6 @@ def to_u8(binary01: np.ndarray) -> np.ndarray:
 # ----------------------------
 
 def ccl_labels(binary01: np.ndarray, connectivity: int = 8):
-    """
-    Connected components for binary image.
-    Returns (labels, sizes), where labels are 0=background, 1..K components,
-    and sizes is a list of pixel counts.
-    """
     h, w = binary01.shape
     labels = np.zeros((h, w), dtype=np.int32)
     sizes = []
@@ -171,6 +168,72 @@ def largest_component(binary01: np.ndarray):
 
 
 # ----------------------------
+# Hole filling (from scratch)
+# ----------------------------
+
+def fill_holes01(binary01: np.ndarray) -> np.ndarray:
+    """
+    Fill holes inside foreground mask by flood-filling background from borders.
+    Background not reachable from border is a hole.
+    """
+    h, w = binary01.shape
+    bg = (binary01 == 0)
+    visited = np.zeros((h, w), dtype=bool)
+    q = deque()
+
+    # Seed border background pixels
+    for x in range(w):
+        if bg[0, x] and not visited[0, x]:
+            visited[0, x] = True
+            q.append((0, x))
+        if bg[h - 1, x] and not visited[h - 1, x]:
+            visited[h - 1, x] = True
+            q.append((h - 1, x))
+    for y in range(h):
+        if bg[y, 0] and not visited[y, 0]:
+            visited[y, 0] = True
+            q.append((y, 0))
+        if bg[y, w - 1] and not visited[y, w - 1]:
+            visited[y, w - 1] = True
+            q.append((y, w - 1))
+
+    nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    while q:
+        y, x = q.popleft()
+        for dy, dx in nbrs:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w:
+                if bg[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    q.append((ny, nx))
+
+    holes = bg & (~visited)
+    filled = binary01.copy()
+    filled[holes] = 1
+    return filled
+
+
+# ----------------------------
+# Defect holes excluding central hole
+# ----------------------------
+
+def defect_hole_area_excluding_central(ring01: np.ndarray, filled01: np.ndarray) -> int:
+    """
+    voidmask = filled - ring contains:
+      - the expected central hole (largest void component)
+      - any smaller enclosed voids (defect holes)
+    Defect hole area = total void area - largest void area
+    """
+    voidmask = ((filled01 == 1) & (ring01 == 0)).astype(np.uint8)
+    _, sizes = ccl_labels(voidmask, connectivity=8)
+    if not sizes:
+        return 0
+    total_void = int(np.sum(sizes))
+    largest_void = int(np.max(sizes))
+    return max(0, total_void - largest_void)
+
+
+# ----------------------------
 # Main
 # ----------------------------
 
@@ -203,12 +266,16 @@ def main() -> int:
         cleaned01 = close01(binary01, se, iterations=2)
 
         ring01, ring_size = largest_component(cleaned01)
+        filled01 = fill_holes01(ring01)
+
+        defect_holes = defect_hole_area_excluding_central(ring01, filled01)
 
         cv.imwrite(str(output_dir / f"{img_path.stem}_binary.png"), to_u8(binary01))
         cv.imwrite(str(output_dir / f"{img_path.stem}_cleaned.png"), to_u8(cleaned01))
         cv.imwrite(str(output_dir / f"{img_path.stem}_ring.png"), to_u8(ring01))
+        cv.imwrite(str(output_dir / f"{img_path.stem}_filled.png"), to_u8(filled01))
 
-        print(f"{img_path.name}: Otsu T={t}, ring_size={ring_size}")
+        print(f"{img_path.name}: T={t}, ring_size={ring_size}, defect_holes={defect_holes}")
 
     print("Done.")
     return 0
