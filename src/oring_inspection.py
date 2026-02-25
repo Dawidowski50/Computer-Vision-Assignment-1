@@ -2,27 +2,38 @@
 """
 Computer Vision Assignment 1
 
-Commit 5:
+Commit 6:
 - Manual histogram + Otsu threshold
-- Manual binary morphology (closing)
-- Manual connected component labelling (BFS)
-- Extract largest component as O-ring
-- Fill holes (flood-fill background from borders)
-- Compute defect-hole pixels excluding the central hole (largest enclosed void)
-- Save binary, cleaned, ring, filled masks
+- Manual morphology (closing)
+- Manual connected components (BFS) → largest component is ring
+- Hole filling (flood fill)
+- Defect-hole metric excluding central hole
+- Basic PASS/FAIL classification (temporary rules)
+- Timing per image + annotated output image
 """
 
 import argparse
+import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import cv2 as cv
 import numpy as np
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
 def list_images(folder: Path):
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
     return [p for p in sorted(folder.iterdir()) if p.suffix.lower() in exts]
+
+
+def to_u8(binary01: np.ndarray) -> np.ndarray:
+    return (binary01.astype(np.uint8) * 255)
 
 
 # ----------------------------
@@ -110,10 +121,6 @@ def close01(binary01: np.ndarray, se: np.ndarray, iterations: int = 1) -> np.nda
     return x
 
 
-def to_u8(binary01: np.ndarray) -> np.ndarray:
-    return (binary01.astype(np.uint8) * 255)
-
-
 # ----------------------------
 # Connected Component Labelling (BFS)
 # ----------------------------
@@ -172,16 +179,11 @@ def largest_component(binary01: np.ndarray):
 # ----------------------------
 
 def fill_holes01(binary01: np.ndarray) -> np.ndarray:
-    """
-    Fill holes inside foreground mask by flood-filling background from borders.
-    Background not reachable from border is a hole.
-    """
     h, w = binary01.shape
     bg = (binary01 == 0)
     visited = np.zeros((h, w), dtype=bool)
     q = deque()
 
-    # Seed border background pixels
     for x in range(w):
         if bg[0, x] and not visited[0, x]:
             visited[0, x] = True
@@ -213,17 +215,7 @@ def fill_holes01(binary01: np.ndarray) -> np.ndarray:
     return filled
 
 
-# ----------------------------
-# Defect holes excluding central hole
-# ----------------------------
-
 def defect_hole_area_excluding_central(ring01: np.ndarray, filled01: np.ndarray) -> int:
-    """
-    voidmask = filled - ring contains:
-      - the expected central hole (largest void component)
-      - any smaller enclosed voids (defect holes)
-    Defect hole area = total void area - largest void area
-    """
     voidmask = ((filled01 == 1) & (ring01 == 0)).astype(np.uint8)
     _, sizes = ccl_labels(voidmask, connectivity=8)
     if not sizes:
@@ -231,6 +223,63 @@ def defect_hole_area_excluding_central(ring01: np.ndarray, filled01: np.ndarray)
     total_void = int(np.sum(sizes))
     largest_void = int(np.max(sizes))
     return max(0, total_void - largest_void)
+
+
+# ----------------------------
+# Classification + annotation
+# ----------------------------
+
+@dataclass
+class Features:
+    ring_area: int
+    defect_hole_area: int
+    defect_hole_ratio: float
+
+
+def extract_features(ring01: np.ndarray, filled01: np.ndarray) -> Features:
+    area = int(ring01.sum())
+    defect_holes = defect_hole_area_excluding_central(ring01, filled01)
+    ratio = (defect_holes / area) if area > 0 else 1.0
+    return Features(ring_area=area, defect_hole_area=defect_holes, defect_hole_ratio=float(ratio))
+
+
+def classify(feats: Features) -> Tuple[str, Dict[str, float]]:
+    """
+    Basic rules (temporary):
+    - very small area -> FAIL (segmentation failure)
+    - too many defect hole pixels -> FAIL
+    """
+    dbg = {
+        "ring_area": float(feats.ring_area),
+        "defect_hole_area": float(feats.defect_hole_area),
+        "defect_hole_ratio": float(feats.defect_hole_ratio),
+    }
+
+    if feats.ring_area < 500:
+        return "FAIL", dbg
+    if feats.defect_hole_ratio > 0.08 or feats.defect_hole_area > 300:
+        return "FAIL", dbg
+
+    return "PASS", dbg
+
+
+def overlay_mask(gray_u8: np.ndarray, mask01: np.ndarray) -> np.ndarray:
+    bgr = np.stack([gray_u8, gray_u8, gray_u8], axis=2).copy()
+    m = mask01.astype(bool)
+    bgr[m, 2] = np.clip(bgr[m, 2].astype(np.int16) + 90, 0, 255).astype(np.uint8)
+    bgr[m, 1] = (bgr[m, 1].astype(np.int16) * 0.85).astype(np.uint8)
+    bgr[m, 0] = (bgr[m, 0].astype(np.int16) * 0.85).astype(np.uint8)
+    return bgr
+
+
+def draw_text_lines(img_bgr: np.ndarray, lines: List[str], org: Tuple[int, int] = (10, 30)) -> np.ndarray:
+    out = img_bgr.copy()
+    x, y = org
+    for i, line in enumerate(lines):
+        yy = y + i * 22
+        cv.putText(out, line, (x, yy), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv.LINE_AA)
+        cv.putText(out, line, (x, yy), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv.LINE_AA)
+    return out
 
 
 # ----------------------------
@@ -257,6 +306,8 @@ def main() -> int:
     se = square_se(3)
 
     for img_path in images:
+        t0 = time.perf_counter()
+
         gray = cv.imread(str(img_path), cv.IMREAD_GRAYSCALE)
         if gray is None:
             print(f"Could not read {img_path.name}")
@@ -264,18 +315,34 @@ def main() -> int:
 
         binary01, t = threshold_otsu(gray)
         cleaned01 = close01(binary01, se, iterations=2)
-
-        ring01, ring_size = largest_component(cleaned01)
+        ring01, _ = largest_component(cleaned01)
         filled01 = fill_holes01(ring01)
 
-        defect_holes = defect_hole_area_excluding_central(ring01, filled01)
+        feats = extract_features(ring01, filled01)
+        decision, dbg = classify(feats)
 
-        cv.imwrite(str(output_dir / f"{img_path.stem}_binary.png"), to_u8(binary01))
-        cv.imwrite(str(output_dir / f"{img_path.stem}_cleaned.png"), to_u8(cleaned01))
-        cv.imwrite(str(output_dir / f"{img_path.stem}_ring.png"), to_u8(ring01))
-        cv.imwrite(str(output_dir / f"{img_path.stem}_filled.png"), to_u8(filled01))
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
-        print(f"{img_path.name}: T={t}, ring_size={ring_size}, defect_holes={defect_holes}")
+        # Save masks
+        stem = img_path.stem
+        cv.imwrite(str(output_dir / f"{stem}_binary.png"), to_u8(binary01))
+        cv.imwrite(str(output_dir / f"{stem}_cleaned.png"), to_u8(cleaned01))
+        cv.imwrite(str(output_dir / f"{stem}_ring.png"), to_u8(ring01))
+        cv.imwrite(str(output_dir / f"{stem}_filled.png"), to_u8(filled01))
+
+        # Annotated overlay
+        overlay = overlay_mask(gray, ring01)
+        lines = [
+            img_path.name,
+            f"Result: {decision}",
+            f"Otsu T: {t}",
+            f"Time: {dt_ms:.2f} ms",
+            f"Defect hole ratio: {dbg['defect_hole_ratio']:.3f}",
+        ]
+        annotated = draw_text_lines(overlay, lines)
+        cv.imwrite(str(output_dir / f"{stem}_annotated.png"), annotated)
+
+        print(f"{img_path.name}: {decision} (T={t}, {dt_ms:.2f}ms)")
 
     print("Done.")
     return 0
