@@ -2,14 +2,10 @@
 """
 Computer Vision Assignment 1
 
-Commit 6:
-- Manual histogram + Otsu threshold
-- Manual morphology (closing)
-- Manual connected components (BFS) → largest component is ring
-- Hole filling (flood fill)
-- Defect-hole metric excluding central hole
-- Basic PASS/FAIL classification (temporary rules)
-- Timing per image + annotated output image
+Commit 7:
+- Multi-radius angular gap sampling
+- Robust break + nick detection
+- Final PASS/FAIL logic
 """
 
 import argparse
@@ -24,7 +20,19 @@ import numpy as np
 
 
 # ----------------------------
-# Helpers
+# Parameters
+# ----------------------------
+
+SE_SIZE = 3
+N_ANGLES = 720
+GAP_BREAK_THR = 0.05
+GAP_NICK_THR = 0.015
+GAP_RADII_FRACTIONS = (0.15, 0.50, 0.85)
+MIN_RING_AREA = 500
+
+
+# ----------------------------
+# Utility
 # ----------------------------
 
 def list_images(folder: Path):
@@ -37,7 +45,7 @@ def to_u8(binary01: np.ndarray) -> np.ndarray:
 
 
 # ----------------------------
-# Histogram + Otsu threshold
+# Otsu
 # ----------------------------
 
 def histogram_u8(gray_u8: np.ndarray) -> np.ndarray:
@@ -55,7 +63,7 @@ def otsu_threshold(hist: np.ndarray) -> int:
     mu = np.cumsum(prob * np.arange(256))
     mu_t = mu[-1]
 
-    denom = omega * (1.0 - omega)
+    denom = omega * (1 - omega)
     denom[denom == 0] = np.nan
     sigma_b2 = (mu_t * omega - mu) ** 2 / denom
 
@@ -69,50 +77,42 @@ def threshold_otsu(gray_u8: np.ndarray):
 
 
 # ----------------------------
-# Binary morphology (from scratch)
+# Morphology
 # ----------------------------
 
-def square_se(size: int = 3) -> np.ndarray:
-    if size < 1 or size % 2 == 0:
-        raise ValueError("SE size must be odd and >= 1")
+def square_se(size: int = 3):
     return np.ones((size, size), dtype=np.uint8)
 
 
-def dilate01(binary01: np.ndarray, se: np.ndarray) -> np.ndarray:
+def dilate01(binary01: np.ndarray, se: np.ndarray):
     h, w = binary01.shape
     kh, kw = se.shape
     ph, pw = kh // 2, kw // 2
-
-    padded = np.pad(binary01, ((ph, ph), (pw, pw)), mode="constant", constant_values=0)
-    out = np.zeros((h, w), dtype=np.uint8)
+    padded = np.pad(binary01, ((ph, ph), (pw, pw)), mode="constant")
+    out = np.zeros_like(binary01)
 
     for i in range(kh):
         for j in range(kw):
-            if se[i, j] == 0:
-                continue
-            out = np.maximum(out, padded[i:i + h, j:j + w])
-
+            if se[i, j]:
+                out = np.maximum(out, padded[i:i + h, j:j + w])
     return out
 
 
-def erode01(binary01: np.ndarray, se: np.ndarray) -> np.ndarray:
+def erode01(binary01: np.ndarray, se: np.ndarray):
     h, w = binary01.shape
     kh, kw = se.shape
     ph, pw = kh // 2, kw // 2
-
-    padded = np.pad(binary01, ((ph, ph), (pw, pw)), mode="constant", constant_values=0)
-    out = np.ones((h, w), dtype=np.uint8)
+    padded = np.pad(binary01, ((ph, ph), (pw, pw)), mode="constant")
+    out = np.ones_like(binary01)
 
     for i in range(kh):
         for j in range(kw):
-            if se[i, j] == 0:
-                continue
-            out = np.minimum(out, padded[i:i + h, j:j + w])
-
+            if se[i, j]:
+                out = np.minimum(out, padded[i:i + h, j:j + w])
     return out
 
 
-def close01(binary01: np.ndarray, se: np.ndarray, iterations: int = 1) -> np.ndarray:
+def close01(binary01: np.ndarray, se: np.ndarray, iterations=2):
     x = binary01
     for _ in range(iterations):
         x = dilate01(x, se)
@@ -122,231 +122,159 @@ def close01(binary01: np.ndarray, se: np.ndarray, iterations: int = 1) -> np.nda
 
 
 # ----------------------------
-# Connected Component Labelling (BFS)
+# Connected Components
 # ----------------------------
 
-def ccl_labels(binary01: np.ndarray, connectivity: int = 8):
+def ccl_labels(binary01: np.ndarray):
     h, w = binary01.shape
-    labels = np.zeros((h, w), dtype=np.int32)
+    labels = np.zeros_like(binary01, dtype=np.int32)
     sizes = []
     current = 0
-
-    if connectivity == 8:
-        nbrs = [(-1, -1), (-1, 0), (-1, 1),
-                (0, -1),           (0, 1),
-                (1, -1),  (1, 0),  (1, 1)]
-    elif connectivity == 4:
-        nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    else:
-        raise ValueError("connectivity must be 4 or 8")
-
     q = deque()
+    nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
     for y in range(h):
         for x in range(w):
-            if binary01[y, x] == 1 and labels[y, x] == 0:
+            if binary01[y,x] and labels[y,x]==0:
                 current += 1
-                labels[y, x] = current
-                q.append((y, x))
-                count = 0
-
+                labels[y,x] = current
+                q.append((y,x))
+                count=0
                 while q:
-                    cy, cx = q.popleft()
-                    count += 1
-                    for dy, dx in nbrs:
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < h and 0 <= nx < w:
-                            if binary01[ny, nx] == 1 and labels[ny, nx] == 0:
-                                labels[ny, nx] = current
-                                q.append((ny, nx))
-
+                    cy,cx = q.popleft()
+                    count+=1
+                    for dy,dx in nbrs:
+                        ny,nx = cy+dy,cx+dx
+                        if 0<=ny<h and 0<=nx<w:
+                            if binary01[ny,nx] and labels[ny,nx]==0:
+                                labels[ny,nx]=current
+                                q.append((ny,nx))
                 sizes.append(count)
+    return labels,sizes
 
-    return labels, sizes
 
-
-def largest_component(binary01: np.ndarray):
-    labels, sizes = ccl_labels(binary01, connectivity=8)
+def largest_component(binary01):
+    labels,sizes=ccl_labels(binary01)
     if not sizes:
-        return np.zeros_like(binary01, dtype=np.uint8), 0
-    k = int(np.argmax(np.asarray(sizes))) + 1
-    mask01 = (labels == k).astype(np.uint8)
-    return mask01, sizes[k - 1]
+        return np.zeros_like(binary01),0
+    k=int(np.argmax(sizes))+1
+    return (labels==k).astype(np.uint8),sizes[k-1]
 
 
 # ----------------------------
-# Hole filling (from scratch)
+# Gap Detection
 # ----------------------------
 
-def fill_holes01(binary01: np.ndarray) -> np.ndarray:
-    h, w = binary01.shape
-    bg = (binary01 == 0)
-    visited = np.zeros((h, w), dtype=bool)
-    q = deque()
-
-    for x in range(w):
-        if bg[0, x] and not visited[0, x]:
-            visited[0, x] = True
-            q.append((0, x))
-        if bg[h - 1, x] and not visited[h - 1, x]:
-            visited[h - 1, x] = True
-            q.append((h - 1, x))
-    for y in range(h):
-        if bg[y, 0] and not visited[y, 0]:
-            visited[y, 0] = True
-            q.append((y, 0))
-        if bg[y, w - 1] and not visited[y, w - 1]:
-            visited[y, w - 1] = True
-            q.append((y, w - 1))
-
-    nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    while q:
-        y, x = q.popleft()
-        for dy, dx in nbrs:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w:
-                if bg[ny, nx] and not visited[ny, nx]:
-                    visited[ny, nx] = True
-                    q.append((ny, nx))
-
-    holes = bg & (~visited)
-    filled = binary01.copy()
-    filled[holes] = 1
-    return filled
+def gap_at_radius(ring01, cy, cx, radius):
+    h,w=ring01.shape
+    angles=np.linspace(0,2*np.pi,N_ANGLES,endpoint=False)
+    xs=np.round(cx+radius*np.cos(angles)).astype(int)
+    ys=np.round(cy+radius*np.sin(angles)).astype(int)
+    valid=(xs>=0)&(xs<w)&(ys>=0)&(ys<h)
+    samples=ring01[ys[valid],xs[valid]]
+    if samples.size==0:
+        return 1.0
+    missing=(samples==0).astype(int)
+    doubled=np.concatenate([missing,missing])
+    max_run=run=0
+    for v in doubled:
+        if v:
+            run+=1
+            max_run=max(max_run,run)
+        else:
+            run=0
+    return min(max_run,len(missing))/len(missing)
 
 
-def defect_hole_area_excluding_central(ring01: np.ndarray, filled01: np.ndarray) -> int:
-    voidmask = ((filled01 == 1) & (ring01 == 0)).astype(np.uint8)
-    _, sizes = ccl_labels(voidmask, connectivity=8)
-    if not sizes:
-        return 0
-    total_void = int(np.sum(sizes))
-    largest_void = int(np.max(sizes))
-    return max(0, total_void - largest_void)
+def max_gap_multi_radius(ring01):
+    ys,xs=np.nonzero(ring01)
+    if xs.size==0:
+        return 1.0
+    cy,cx=float(ys.mean()),float(xs.mean())
+    r=np.sqrt((xs-cx)**2+(ys-cy)**2)
+    r_outer=float(np.percentile(r,99))
+    r_inner=float(np.percentile(r,5))
+    thickness=r_outer-r_inner
+    worst=0
+    for f in GAP_RADII_FRACTIONS:
+        radius=r_inner+f*thickness
+        worst=max(worst,gap_at_radius(ring01,cy,cx,radius))
+    return worst
 
 
 # ----------------------------
-# Classification + annotation
+# Classification
 # ----------------------------
 
 @dataclass
 class Features:
-    ring_area: int
-    defect_hole_area: int
-    defect_hole_ratio: float
+    ring_area:int
+    max_gap_frac:float
 
 
-def extract_features(ring01: np.ndarray, filled01: np.ndarray) -> Features:
-    area = int(ring01.sum())
-    defect_holes = defect_hole_area_excluding_central(ring01, filled01)
-    ratio = (defect_holes / area) if area > 0 else 1.0
-    return Features(ring_area=area, defect_hole_area=defect_holes, defect_hole_ratio=float(ratio))
-
-
-def classify(feats: Features) -> Tuple[str, Dict[str, float]]:
-    """
-    Basic rules (temporary):
-    - very small area -> FAIL (segmentation failure)
-    - too many defect hole pixels -> FAIL
-    """
-    dbg = {
-        "ring_area": float(feats.ring_area),
-        "defect_hole_area": float(feats.defect_hole_area),
-        "defect_hole_ratio": float(feats.defect_hole_ratio),
-    }
-
-    if feats.ring_area < 500:
-        return "FAIL", dbg
-    if feats.defect_hole_ratio > 0.08 or feats.defect_hole_area > 300:
-        return "FAIL", dbg
-
-    return "PASS", dbg
-
-
-def overlay_mask(gray_u8: np.ndarray, mask01: np.ndarray) -> np.ndarray:
-    bgr = np.stack([gray_u8, gray_u8, gray_u8], axis=2).copy()
-    m = mask01.astype(bool)
-    bgr[m, 2] = np.clip(bgr[m, 2].astype(np.int16) + 90, 0, 255).astype(np.uint8)
-    bgr[m, 1] = (bgr[m, 1].astype(np.int16) * 0.85).astype(np.uint8)
-    bgr[m, 0] = (bgr[m, 0].astype(np.int16) * 0.85).astype(np.uint8)
-    return bgr
-
-
-def draw_text_lines(img_bgr: np.ndarray, lines: List[str], org: Tuple[int, int] = (10, 30)) -> np.ndarray:
-    out = img_bgr.copy()
-    x, y = org
-    for i, line in enumerate(lines):
-        yy = y + i * 22
-        cv.putText(out, line, (x, yy), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv.LINE_AA)
-        cv.putText(out, line, (x, yy), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv.LINE_AA)
-    return out
+def classify(feats:Features):
+    if feats.ring_area<MIN_RING_AREA:
+        return "FAIL"
+    if feats.max_gap_frac>GAP_BREAK_THR:
+        return "FAIL"
+    if feats.max_gap_frac>GAP_NICK_THR:
+        return "FAIL"
+    return "PASS"
 
 
 # ----------------------------
 # Main
 # ----------------------------
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Folder containing O-ring images")
-    parser.add_argument("--output", default="outputs", help="Output folder")
-    args = parser.parse_args()
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--input",required=True)
+    parser.add_argument("--output",default="outputs")
+    args=parser.parse_args()
 
-    input_dir = Path(args.input).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    input_dir=Path(args.input)
+    output_dir=Path(args.output)
+    output_dir.mkdir(exist_ok=True)
 
-    images = list_images(input_dir)
-    if not images:
-        print(f"No images found in {input_dir}")
-        return 1
+    se=square_se(SE_SIZE)
 
-    print(f"Found {len(images)} images in {input_dir}")
+    for img_path in list_images(input_dir):
+        t0=time.perf_counter()
+        gray=cv.imread(str(img_path),cv.IMREAD_GRAYSCALE)
+        binary,_=threshold_otsu(gray)
+        cleaned=close01(binary,se)
+        ring,_=largest_component(cleaned)
+        gap=max_gap_multi_radius(ring)
+        feats=Features(int(ring.sum()),gap)
+        decision=classify(feats)
+        dt=(time.perf_counter()-t0)*1000
 
-    se = square_se(3)
+        overlay=np.stack([gray,gray,gray],axis=2)
+        overlay[ring.astype(bool)]=[0,0,255]
 
-    for img_path in images:
-        t0 = time.perf_counter()
-
-        gray = cv.imread(str(img_path), cv.IMREAD_GRAYSCALE)
-        if gray is None:
-            print(f"Could not read {img_path.name}")
-            continue
-
-        binary01, t = threshold_otsu(gray)
-        cleaned01 = close01(binary01, se, iterations=2)
-        ring01, _ = largest_component(cleaned01)
-        filled01 = fill_holes01(ring01)
-
-        feats = extract_features(ring01, filled01)
-        decision, dbg = classify(feats)
-
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-
-        # Save masks
-        stem = img_path.stem
-        cv.imwrite(str(output_dir / f"{stem}_binary.png"), to_u8(binary01))
-        cv.imwrite(str(output_dir / f"{stem}_cleaned.png"), to_u8(cleaned01))
-        cv.imwrite(str(output_dir / f"{stem}_ring.png"), to_u8(ring01))
-        cv.imwrite(str(output_dir / f"{stem}_filled.png"), to_u8(filled01))
-
-        # Annotated overlay
-        overlay = overlay_mask(gray, ring01)
-        lines = [
+        lines=[
             img_path.name,
             f"Result: {decision}",
-            f"Otsu T: {t}",
-            f"Time: {dt_ms:.2f} ms",
-            f"Defect hole ratio: {dbg['defect_hole_ratio']:.3f}",
+            f"Max gap: {gap:.3f}",
+            f"Time: {dt:.2f} ms"
         ]
-        annotated = draw_text_lines(overlay, lines)
-        cv.imwrite(str(output_dir / f"{stem}_annotated.png"), annotated)
 
-        print(f"{img_path.name}: {decision} (T={t}, {dt_ms:.2f}ms)")
+        y=30
+        for line in lines:
+            cv.putText(overlay,line,(10,y),
+                       cv.FONT_HERSHEY_SIMPLEX,0.6,
+                       (255,255,255),2,cv.LINE_AA)
+            cv.putText(overlay,line,(10,y),
+                       cv.FONT_HERSHEY_SIMPLEX,0.6,
+                       (0,0,0),1,cv.LINE_AA)
+            y+=22
+
+        cv.imwrite(str(output_dir/f"{img_path.stem}_annotated.png"),overlay)
+
+        print(f"{img_path.name}: {decision} (gap={gap:.3f})")
 
     print("Done.")
-    return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":
+    main()
