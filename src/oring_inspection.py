@@ -17,8 +17,11 @@ import numpy as np
 
 
 # ----------------------------
-# Parameters
+# Detection Parameters
 # ----------------------------
+# These parameters control defect detection.
+# The algorithm measures the largest missing arc around the ring.
+# Large arcs indicate a cut/break, smaller arcs indicate nicks.
 
 SE_SIZE = 3                 # Structuring element size for morphology
 N_ANGLES = 720              # Number of angular samples around ring
@@ -87,8 +90,8 @@ def threshold_otsu(gray_u8: np.ndarray):
     """
     Apply Otsu thresholding
 
-    O-ring is darker than background so:
-    pixel <= threshold -> foreground
+    The O-ring is darker than the background,
+    so pixels below the threshold become foreground.
     """
 
     t = otsu_threshold(histogram_u8(gray_u8))
@@ -247,7 +250,10 @@ def largest_component(binary01):
 
 def gap_at_radius(ring01, cy, cx, radius):
     """
-    Measure longest missing arc at a given radius
+    Sample points around the ring at a given radius.
+
+    Missing pixels along the circle indicate
+    defects such as nicks or breaks.
     """
 
     h,w=ring01.shape
@@ -284,11 +290,10 @@ def gap_at_radius(ring01, cy, cx, radius):
 
 def max_gap_multi_radius(ring01):
     """
-    Compute worst gap across multiple radii
+    Compute worst gap across multiple radii.
 
-    Detects both:
-    - full breaks
-    - small nicks
+    Sampling inner, middle and outer radii
+    ensures defects across the ring thickness are detected.
     """
 
     ys,xs=np.nonzero(ring01)
@@ -335,18 +340,22 @@ class Features:
 
 def classify(feats:Features):
     """
-    PASS / FAIL decision
+    PASS / FAIL decision based on detected gap size
     """
 
+    # Reject very small objects (segmentation failure)
     if feats.ring_area<MIN_RING_AREA:
         return "FAIL"
 
+    # Large gap indicates a broken ring
     if feats.max_gap_frac>GAP_BREAK_THR:
         return "FAIL"
 
+    # Smaller gaps indicate edge nicks
     if feats.max_gap_frac>GAP_NICK_THR:
         return "FAIL"
 
+    # Otherwise the ring is continuous
     return "PASS"
 
 
@@ -372,36 +381,37 @@ def main():
 
     for img_path in list_images(input_dir):
 
-        # Start timing
+        # Start processing timer
         t0=time.perf_counter()
 
         # Load grayscale image
         gray=cv.imread(str(img_path),cv.IMREAD_GRAYSCALE)
 
-        # Segment O-ring
+        # Segment the O-ring from the background
         binary,_=threshold_otsu(gray)
 
-        # Clean segmentation
+        # Clean segmentation using morphology
         cleaned=close01(binary,se)
 
-        # Extract O-ring region
+        # Extract the largest connected region (the ring)
         ring,_=largest_component(cleaned)
 
-        # Measure gap defects
+        # Measure defects by finding largest missing arc
         gap=max_gap_multi_radius(ring)
 
         feats=Features(int(ring.sum()),gap)
 
+        # Determine PASS / FAIL
         decision=classify(feats)
 
         dt=(time.perf_counter()-t0)*1000
 
-        # Create overlay image
+        # Create visualization overlay
         overlay=np.stack([gray,gray,gray],axis=2)
 
         overlay[ring.astype(bool)]=[0,0,255]
 
-        # Annotation text
+        # Display results on image
         lines=[
             img_path.name,
             f"Result: {decision}",
